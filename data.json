@@ -1,0 +1,170 @@
+"""BringBack — 장소별 물건 챙김 체크리스트 웹앱 (Streamlit).
+
+실행::
+
+    streamlit run app.py
+"""
+import pandas as pd
+import streamlit as st
+
+import storage
+
+
+def _sync_load() -> dict:
+    """최초 1회 data.json을 세션에 적재하고 반환한다."""
+    if "data" not in st.session_state:
+        st.session_state.data = storage.load_data()
+    return st.session_state.data
+
+
+def _persist() -> None:
+    """세션 데이터를 파일에 저장한다 (write-through)."""
+    storage.save_data(st.session_state.data)
+
+
+def _flash(kind: str, msg: str) -> None:
+    """다음 화면 상단에 보여줄 메시지를 저장하고 새로고침한다.
+
+    (메시지를 세션에 보관 → rerun 후 상단에서 1회 표시하므로,
+     체크박스 등 위젯이 깨끗한 상태로 리셋되면서도 안내는 사라지지 않는다.)
+    """
+    st.session_state.flash = (kind, msg)
+    st.rerun()
+
+
+def _show_flash() -> None:
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        getattr(st, flash[0])(flash[1])
+
+
+def render_register() -> None:
+    st.header("📍 장소·물건 등록")
+    data = st.session_state.data
+
+    # --- 장소 추가 ---
+    st.subheader("장소 추가")
+    new_place = st.text_input("새 장소 이름", key="new_place_input", placeholder="예: 도서관")
+    if st.button("장소 추가", key="add_place_btn"):
+        _, err = storage.add_place(data, new_place)
+        if err:
+            _flash("error", err)            # EDGE-1 빈입력 / EDGE-3 중복
+        else:
+            _persist()
+            _flash("success", f"'{new_place.strip()}' 장소를 추가했습니다.")
+
+    if not data["places"]:
+        st.info("아직 등록된 장소가 없습니다. 위에서 장소를 먼저 추가하세요.")
+        return
+
+    # --- 물건 관리 (장소 선택 후) ---
+    st.divider()
+    st.subheader("물건 관리")
+    place = st.selectbox("장소 선택", list(data["places"].keys()), key="register_place_select")
+
+    new_item = st.text_input(f"'{place}'에 추가할 물건", key="new_item_input", placeholder="예: 충전기")
+    if st.button("물건 추가", key="add_item_btn"):
+        _, err = storage.add_item(data, place, new_item)
+        if err:
+            _flash("error", err)            # EDGE-1 빈입력 / EDGE-3 중복
+        else:
+            _persist()
+            _flash("success", f"'{new_item.strip()}'을(를) 추가했습니다.")
+
+    items = data["places"][place]
+    if items:
+        st.write(f"**{place}**에 등록된 물건:")
+        for item in list(items):
+            col1, col2 = st.columns([4, 1])
+            col1.write(f"- {item}")
+            if col2.button("삭제", key=f"del_item_{place}_{item}"):
+                storage.delete_item(data, place, item)
+                _persist()
+                _flash("success", f"'{item}'을(를) 삭제했습니다.")
+    else:
+        st.caption("이 장소에 등록된 물건이 없습니다.")
+
+    st.divider()
+    if st.button(f"🗑️ '{place}' 장소 삭제", key="del_place_btn"):
+        storage.delete_place(data, place)
+        _persist()
+        _flash("success", f"'{place}' 장소를 삭제했습니다.")
+
+
+def render_checkout() -> None:
+    st.header("🚪 나가기 — 물건 챙김 확인")
+    data = st.session_state.data
+
+    if not data["places"]:
+        st.info("등록된 장소가 없습니다. '등록' 화면에서 장소와 물건을 먼저 추가하세요.")
+        return
+
+    place = st.selectbox("떠나는 장소", list(data["places"].keys()), key="checkout_place_select")
+
+    # ★ 삭제된 장소 방어: 선택값이 더 이상 존재하지 않으면 안내
+    if place not in data["places"]:
+        st.info("선택한 장소를 찾을 수 없습니다. 다른 장소를 선택해주세요.")
+        return
+
+    items = data["places"][place]
+    if not items:
+        st.info("이 장소에 등록된 물건이 없습니다. 먼저 물건을 등록하세요.")  # EDGE-2 빈 체크리스트
+        return
+
+    # ★ 체크박스 리셋: session_state 카운터를 키에 포함, 완료 시 증가시켜
+    #   다음 렌더에서 새 미체크 상태가 되도록 한다 (KeyError 없이 안전).
+    round_no = st.session_state.get("checkout_round", 0)
+    st.write(f"**{place}**를 떠나기 전 챙긴 물건을 체크하세요:")
+    checked = {}
+    for item in items:
+        checked[item] = st.checkbox(item, key=f"chk_{round_no}_{place}_{item}")
+
+    if st.button("나가기 완료", key="checkout_done_btn"):
+        missed = [item for item in items if not checked.get(item)]
+        st.session_state.checkout_round = round_no + 1  # 다음엔 새 체크리스트
+        if missed:
+            storage.record_misses(data, place, missed)
+            _persist()
+            _flash("warning", f"⚠️ {', '.join(missed)}을(를) 두고 가셨어요 — 기록했습니다.")
+        else:
+            _flash("success", "✅ 잘 챙기셨어요! 모두 확인했습니다.")
+
+
+def render_stats() -> None:
+    st.header("📊 미챙김 통계")
+    data = st.session_state.data
+
+    stats = storage.get_miss_stats(data)
+    if not stats:  # ★ 빈 통계 가드: 차트·목록 모두 생략하고 안내만
+        st.info("아직 미챙김 기록이 없습니다.")
+        return
+
+    st.subheader("물건별 미챙김 횟수")
+    df = pd.DataFrame({"미챙김 횟수": stats})
+    st.bar_chart(df)
+
+    st.subheader("최근 미챙김 기록")
+    recent = storage.get_recent_misses(data, 10)
+    st.table([{"물건": e["item"], "장소": e["place"], "시각": e["ts"]} for e in recent])
+
+
+def main() -> None:
+    st.set_page_config(page_title="BringBack", page_icon="🎒")
+    _sync_load()
+
+    st.sidebar.title("🎒 BringBack")
+    st.sidebar.caption("물건 두고 오지 않게 챙겨주는 도우미")
+    page = st.sidebar.radio("메뉴", ["📍 등록", "🚪 나가기", "📊 통계"], key="nav")
+
+    _show_flash()
+
+    if page == "📍 등록":
+        render_register()
+    elif page == "🚪 나가기":
+        render_checkout()
+    else:
+        render_stats()
+
+
+if __name__ == "__main__":
+    main()
